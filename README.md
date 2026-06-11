@@ -1,14 +1,23 @@
-# ImagesDataset
+# People Image Dataset Builder
 
-Aplicación Java para recolectar imágenes desde Google Images a partir de un archivo JSON con personas, guardar las imágenes descargadas junto con metadatos en formato JSON y generar un archivo final comprimido `.tar.gz`.
+<p align="center">
+  <img src="https://img.shields.io/badge/Java-21-orange?style=for-the-badge&logo=openjdk&logoColor=white" alt="Java 21" />
+  <img src="https://img.shields.io/badge/Maven-3.9+-C71A36?style=for-the-badge&logo=apachemaven&logoColor=white" alt="Maven" />
+  <img src="https://img.shields.io/badge/Selenium-4.33.0-43B02A?style=for-the-badge&logo=selenium&logoColor=white" alt="Selenium" />
+  <img src="https://img.shields.io/badge/Desktop%20App-Java%20Swing-blue?style=for-the-badge" alt="Java Swing" />
+  <img src="https://img.shields.io/badge/Export-TAR.GZ-yellow?style=for-the-badge" alt="TAR.GZ Export" />
+</p>
 
-El proyecto está pensado para construir datasets de imágenes de personas, con soporte para filtros de búsqueda, generación de metadatos por imagen/persona y empaquetado automático del resultado.
+Aplicación de escritorio desarrollada en Java para construir datasets de imágenes de personas a partir de búsquedas automatizadas en Google Images.
+
+El sistema permite cargar un archivo JSON con personas, buscar imágenes por nombre y sinónimos, descargar imágenes, generar metadata individual en formato JSON y empaquetar el resultado final en un archivo `.tar.gz` listo para distribución o procesamiento posterior.
 
 ---
 
 ## Índice
 
 - [Características principales](#características-principales)
+- [Herramientas y tecnologías utilizadas](#herramientas-y-tecnologías-utilizadas)
 - [Arquitectura del proyecto](#arquitectura-del-proyecto)
 - [Requisitos](#requisitos)
 - [Instalación y compilación](#instalación-y-compilación)
@@ -25,6 +34,7 @@ El proyecto está pensado para construir datasets de imágenes de personas, con 
 - [Troubleshooting](#troubleshooting)
 - [Notas técnicas importantes](#notas-técnicas-importantes)
 - [Mejoras sugeridas](#mejoras-sugeridas)
+- [Comandos útiles](#comandos-útiles)
 
 ---
 
@@ -42,6 +52,71 @@ El proyecto está pensado para construir datasets de imágenes de personas, con 
 - Interfaz gráfica simple usando Java Swing.
 - Ejecución alternativa por archivo `.properties`.
 - Uso de Selenium Manager para resolver ChromeDriver automáticamente.
+- Registro de tiempos y fallos mediante archivos JSON auxiliares.
+
+---
+
+## Herramientas y tecnologías utilizadas
+
+Este proyecto fue desarrollado como una aplicación de escritorio en Java para automatizar la búsqueda, descarga, registro y empaquetado de imágenes de personas.
+
+<p align="left">
+  <img src="https://img.shields.io/badge/Java-21-orange?style=for-the-badge&logo=openjdk&logoColor=white" alt="Java 21" />
+  <img src="https://img.shields.io/badge/Maven-Build%20Tool-C71A36?style=for-the-badge&logo=apachemaven&logoColor=white" alt="Maven" />
+  <img src="https://img.shields.io/badge/Selenium-Web%20Automation-43B02A?style=for-the-badge&logo=selenium&logoColor=white" alt="Selenium" />
+  <img src="https://img.shields.io/badge/Google%20Chrome-Browser-4285F4?style=for-the-badge&logo=googlechrome&logoColor=white" alt="Google Chrome" />
+  <img src="https://img.shields.io/badge/Java%20Swing-Desktop%20UI-blue?style=for-the-badge" alt="Java Swing" />
+</p>
+
+<p align="left">
+  <img src="https://img.shields.io/badge/Gson-JSON%20Processing-8A2BE2?style=for-the-badge" alt="Gson" />
+  <img src="https://img.shields.io/badge/Apache%20Tika-MIME%20Detection-5D6D7E?style=for-the-badge&logo=apache&logoColor=white" alt="Apache Tika" />
+  <img src="https://img.shields.io/badge/Apache%20Commons-Utilities-D22128?style=for-the-badge&logo=apache&logoColor=white" alt="Apache Commons" />
+  <img src="https://img.shields.io/badge/SLF4J-Logging-2C3E50?style=for-the-badge" alt="SLF4J" />
+  <img src="https://img.shields.io/badge/WebP-Support-00A98F?style=for-the-badge" alt="WebP Support" />
+</p>
+
+### Stack principal
+
+| Tecnología | Uso dentro del proyecto |
+|---|---|
+| **Java 21** | Lenguaje principal utilizado para desarrollar la aplicación. |
+| **Maven** | Gestión de dependencias, compilación y generación del `.jar`. |
+| **Java Swing** | Interfaz gráfica de escritorio para ejecutar el flujo de descarga. |
+| **Selenium WebDriver** | Automatización del navegador para realizar búsquedas en Google Images. |
+| **Google Chrome / ChromeDriver** | Navegador utilizado por Selenium para obtener resultados de imágenes. |
+| **Selenium Manager** | Resolución automática del ChromeDriver compatible con la versión instalada de Chrome. |
+| **Gson** | Lectura y escritura de archivos JSON de entrada, metadata y perfiles. |
+| **Apache Tika** | Detección del tipo MIME de las imágenes descargadas. |
+| **Apache Commons Lang** | Utilidades generales usadas por el proyecto. |
+| **Apache Commons Compress** | Generación de archivos comprimidos `.tar.gz`. |
+| **SLF4J + Simple Logger** | Registro de logs de ejecución, tiempos y errores. |
+| **webp-imageio** | Soporte adicional para trabajar con imágenes en formato WebP. |
+
+### Funcionalidades implementadas
+
+<p align="left">
+  <img src="https://img.shields.io/badge/Image%20Search-Automated-success?style=flat-square" alt="Automated Image Search" />
+  <img src="https://img.shields.io/badge/Image%20Download-Enabled-success?style=flat-square" alt="Image Download" />
+  <img src="https://img.shields.io/badge/Metadata-JSON-blue?style=flat-square" alt="JSON Metadata" />
+  <img src="https://img.shields.io/badge/Export-TAR.GZ-yellow?style=flat-square" alt="TAR.GZ Export" />
+  <img src="https://img.shields.io/badge/Desktop%20App-Swing-lightgrey?style=flat-square" alt="Desktop App" />
+</p>
+
+- Búsqueda automática de imágenes por nombre de persona y sinónimos.
+- Descarga de imágenes desde resultados de Google Images.
+- Generación de metadata individual por imagen en formato JSON.
+- Registro de tiempos de ejecución en `profile.json`.
+- Registro de fallos de descarga en `failsProfile.json`.
+- Empaquetado final del dataset en formato `.tar.gz`.
+- Configuración externa mediante archivos JSON y properties.
+- Ejecución desde interfaz gráfica Java Swing.
+
+### Consideraciones técnicas
+
+> Google Images puede mostrar captchas o pantallas de verificación cuando detecta automatización. Para reducir este problema, se recomienda ejecutar Chrome en modo visible y utilizar un perfil persistente mediante `--user-data-dir`.
+
+> El proyecto utiliza Selenium Manager para resolver automáticamente el ChromeDriver compatible con la versión instalada de Google Chrome.
 
 ---
 
