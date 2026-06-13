@@ -10,7 +10,9 @@ import java.net.URL;
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.nio.file.StandardCopyOption;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.time.Duration;
@@ -21,6 +23,8 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
@@ -38,6 +42,8 @@ import org.apache.commons.lang3.time.StopWatch;
 import org.apache.tika.Tika;
 import org.openqa.selenium.By;
 import org.openqa.selenium.JavascriptExecutor;
+import org.openqa.selenium.OutputType;
+import org.openqa.selenium.TakesScreenshot;
 import org.openqa.selenium.TimeoutException;
 import org.openqa.selenium.WebElement;
 import org.openqa.selenium.chrome.ChromeDriver;
@@ -73,14 +79,32 @@ public class ImageDownloader {
 
 	private static final String SOURCE_WEBSITE = "google_images";
 	private static final String BASE_64 = "base64";
-	private static final String ENCRYPTED = "encrypted";
+
+	private static final Pattern URL_IN_PAGE_SOURCE_PATTERN = Pattern.compile(
+			"https?://[^\\\"'<>\\s]+",
+			Pattern.CASE_INSENSITIVE
+	);
+
+	private static final String DEBUG_FOLDER = "debug";
+
+	/*
+	 * Google Images changes its internal classes often.
+	 * The safest flow here is:
+	 * 1) collect the search-result links from the main results page before opening previews;
+	 * 2) click those saved main-result links one by one;
+	 * 3) read the large preview image.
+	 * This avoids clicking thumbnails from the side panel or "related images" sections.
+	 */
+	private static final By GOOGLE_DIRECT_RESULT_LINKS = By.cssSelector(
+			"a[href*='/imgres?'], a[href*='imgurl=']"
+	);
 
 	private static final By GOOGLE_IMAGE_THUMBNAILS = By.cssSelector(
-			"img.YQ4gaf, img.Q4LuWd, img.rg_i, div[data-ri] img, a[href*='imgurl='] img"
+			"a[href*='/imgres?'] img, a[href*='imgurl='] img, img.YQ4gaf, img.Q4LuWd, img.rg_i"
 	);
 
 	private static final By GOOGLE_FULL_IMAGES = By.cssSelector(
-		"img.sFlh5c, img.iPVvYb, img.n3VNCb, a[href*='imgurl=']"
+			"img.sFlh5c, img.iPVvYb, img.n3VNCb, img[jsname='kn3ccd'], img[jsname='JuXqh']"
 	);
 
 	private static final DateTimeFormatter DATE_FORMATTER = DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss");
@@ -116,11 +140,23 @@ public class ImageDownloader {
 		this.totalSaveTime = new AtomicLong(0);
 
 		ChromeOptions options = new ChromeOptions();
-		//options.addArguments("--headless=new");
+
+		// Keep Chrome visible. Google Images tends to block/captcha headless sessions.
+		// options.addArguments("--headless=new");
+
 		options.addArguments("--lang=en");
 		options.addArguments("--remote-allow-origins=*");
 		options.addArguments("--disable-gpu");
 		options.addArguments("--window-size=1920,1080");
+
+		// Persistent profile: cookies/session/captcha state are kept between executions.
+		// If Chrome says the profile is already in use, close all Chrome windows opened by this app.
+		options.addArguments("--user-data-dir=C:/selenium-chrome-profile");
+		options.addArguments("--profile-directory=Default");
+
+		// These options do not bypass captcha, but reduce noisy automation banners.
+		options.setExperimentalOption("excludeSwitches", List.of("enable-automation"));
+		options.setExperimentalOption("useAutomationExtension", false);
 
 		driver = new ChromeDriver(options);
 	}
@@ -136,6 +172,7 @@ public class ImageDownloader {
 		try {
 			for (UrlQuery urlQuery : getUrlQuerys(p)) {
 				driver.get(urlQuery.getUrl());
+				sleepQuietly(8500);
 
 				long startTimeScroll = System.nanoTime();
 
@@ -148,12 +185,12 @@ public class ImageDownloader {
 				long endTimeScroll = System.nanoTime();
 				duration = (endTimeScroll - startTimeScroll) / 1000000;
 
-				WebDriverWait wait = new WebDriverWait(driver, Duration.ofSeconds(15));
+				WebDriverWait wait = new WebDriverWait(driver, Duration.ofSeconds(20));
 
 				checkExistenceOfResults(wait, urlQuery);
 
 				long startTimeUrls = System.currentTimeMillis();
-				List<String> urls = collectImageUrls(wait, imagesAmount);
+				List<String> urls = collectImageUrls(wait, imagesAmount, urlQuery);
 				long elapsedTimeUrls = System.currentTimeMillis() - startTimeUrls;
 
 				LOG.info("Tiempo demorado en obtener URLs: {} ms", elapsedTimeUrls);
@@ -190,40 +227,96 @@ public class ImageDownloader {
 		this.totalSaveTime.set(0);
 	}
 
-	private List<String> collectImageUrls(WebDriverWait wait, int limit) {
+	private List<String> collectImageUrls(WebDriverWait wait, int limit, UrlQuery urlQuery) {
 		Set<String> urls = new LinkedHashSet<>();
-		JavascriptExecutor executor = driver;
 
-		List<WebElement> thumbnails = new ArrayList<>(driver.findElements(GOOGLE_IMAGE_THUMBNAILS));
+		LOG.info("Iniciando recoleccion desde resultados principales. Limite: {}", limit);
 
-		LOG.info("Thumbnails encontrados: {}", thumbnails.size());
+		/*
+		 * First strategy:
+		 * Google Images currently keeps many original image URLs inside the page source
+		 * after the results are loaded. Reading those URLs before opening any preview is
+		 * much safer than clicking random images, because it only uses the current main
+		 * search results page and avoids side-panel related images.
+		 */
+		collectUrlsFromPageSource(urls, limit, urlQuery);
 
-		for (WebElement thumbnail : thumbnails) {
-			if (urls.size() >= limit) {
-				break;
-			}
+		if (urls.size() >= limit) {
+			LOG.info("URLs finales encontradas: {}", urls.size());
+			return new ArrayList<>(urls);
+		}
+
+		/*
+		 * Second strategy:
+		 * If page-source extraction did not find enough URLs, fall back to the original
+		 * behavior: collect main result hrefs from the page, open them one by one and
+		 * read the large preview image.
+		 */
+		List<String> mainResultHrefs = collectMainResultHrefs(limit - urls.size(), 30);
+
+		LOG.info("Links principales recolectados antes de abrir vista previa: {}", mainResultHrefs.size());
+
+		if (mainResultHrefs.isEmpty() && urls.isEmpty()) {
+			LOG.info("No se encontraron links principales. Se guarda debug para revisar la pagina actual.");
+			saveDebugFiles("no-results-" + sanitizeFileName(urlQuery.getQuery()));
+			return new ArrayList<>(urls);
+		}
+
+		int index = 0;
+		int attemptsWithoutNewUrls = 0;
+		int maxAttemptsWithoutNewUrls = 60;
+
+		while (urls.size() < limit && index < mainResultHrefs.size() && attemptsWithoutNewUrls < maxAttemptsWithoutNewUrls) {
+			String href = mainResultHrefs.get(index);
+			int before = urls.size();
 
 			try {
-				executor.executeScript("arguments[0].scrollIntoView({block: 'center'});", thumbnail);
-				executor.executeScript("arguments[0].click();", thumbnail);
+				boolean clicked = clickMainResultByHref(href);
 
-				wait.until(ExpectedConditions.presenceOfAllElementsLocatedBy(GOOGLE_FULL_IMAGES));
+				if (!clicked) {
+					LOG.info("No se pudo clickear link principal index {}. Se usara imgurl del href como fallback.", index);
+					String fallbackUrl = extractImgUrlFromGoogleHref(href);
 
-				for (WebElement element : driver.findElements(GOOGLE_FULL_IMAGES)) {
-					String url = extractImageUrl(element);
+					if (isValidImageUrl(fallbackUrl)) {
+						urls.add(fallbackUrl);
+						LOG.info("URL encontrada desde href fallback: {}", fallbackUrl);
+					}
+				} else {
+					sleepQuietly(3300);
+					String previewUrl = waitAndExtractPreviewImageUrl(wait);
 
-					if (isValidImageUrl(url)) {
-						urls.add(url);
-						LOG.info("URL encontrada: {}", url);
+					if (isValidImageUrl(previewUrl)) {
+						boolean added = urls.add(previewUrl);
 
-						if (urls.size() >= limit) {
-							break;
+						if (added) {
+							LOG.info("URL encontrada desde vista previa principal: {}", previewUrl);
+						}
+					} else {
+						String fallbackUrl = extractImgUrlFromGoogleHref(href);
+
+						if (isValidImageUrl(fallbackUrl)) {
+							boolean added = urls.add(fallbackUrl);
+
+							if (added) {
+								LOG.info("URL encontrada desde href de resultado principal: {}", fallbackUrl);
+							}
+						} else {
+							LOG.info("No se encontro URL valida para resultado principal index {}", index);
 						}
 					}
 				}
 			} catch (Exception e) {
-				LOG.info("No se pudo obtener imagen desde thumbnail");
+				LOG.info("No se pudo procesar resultado principal index {}: {}", index, e.getClass().getSimpleName());
 			}
+
+			if (urls.size() == before) {
+				attemptsWithoutNewUrls++;
+			} else {
+				attemptsWithoutNewUrls = 0;
+			}
+
+			index++;
+			sleepQuietly(3800);
 		}
 
 		LOG.info("URLs finales encontradas: {}", urls.size());
@@ -231,81 +324,320 @@ public class ImageDownloader {
 		return new ArrayList<>(urls);
 	}
 
+	private void collectUrlsFromPageSource(Set<String> urls, int limit, UrlQuery urlQuery) {
+		String html = driver.getPageSource();
+		Matcher matcher = URL_IN_PAGE_SOURCE_PATTERN.matcher(html);
+
+		int candidates = 0;
+
+		while (matcher.find() && urls.size() < limit) {
+			String candidate = normalizeUrlFromPageSource(matcher.group());
+
+			if (!isValidImageUrl(candidate)) {
+				continue;
+			}
+
+			candidates++;
+
+			boolean added = urls.add(candidate);
+
+			if (added) {
+				LOG.info("URL encontrada desde page source principal: {}", candidate);
+			}
+		}
+
+		LOG.info(
+				"Extraccion desde page source para query {} - candidatos validos: {} - urls acumuladas: {}",
+				urlQuery.getQuery(),
+				candidates,
+				urls.size()
+		);
+	}
+
+
+	private List<String> collectMainResultHrefs(int limit, int maxScrolls) {
+		Set<String> hrefs = new LinkedHashSet<>();
+		JavascriptExecutor executor = driver;
+		int previousLinksCount = -1;
+		int scrollsWithoutNewLinks = 0;
+
+		for (int scroll = 0; scroll < maxScrolls && hrefs.size() < limit; scroll++) {
+			List<WebElement> links = driver.findElements(GOOGLE_DIRECT_RESULT_LINKS);			
+
+			for (WebElement link : links) {
+				if (hrefs.size() >= limit) {
+					break;
+				}
+
+				try {
+					String href = link.getAttribute("href");
+
+					if (isValidGoogleImageResultHref(href)) {
+						hrefs.add(href);
+					}
+				} catch (Exception e) {
+					LOG.info("No se pudo leer href candidato: {}", e.getClass().getSimpleName());
+				}
+			}
+
+			if (hrefs.size() == previousLinksCount) {
+				scrollsWithoutNewLinks++;
+			} else {
+				scrollsWithoutNewLinks = 0;
+			}
+
+			previousLinksCount = hrefs.size();
+
+			if (scrollsWithoutNewLinks >= 20) {
+				LOG.info("No aparecen nuevos links principales luego de varios scrolls");
+				break;
+			}
+
+			executor.executeScript("window.scrollBy(0, Math.floor(window.innerHeight * 1.4));");
+			sleepQuietly(1400);
+		}
+
+		// Return to the top so clicking saved direct results is more stable.
+		executor.executeScript("window.scrollTo(0, 0);");
+		sleepQuietly(2000);
+
+		return new ArrayList<>(hrefs);
+	}
+
+	private boolean clickMainResultByHref(String href) {
+		if (href == null || href.isBlank()) {
+			return false;
+		}
+
+		JavascriptExecutor executor = driver;
+		Object result = executor.executeScript(
+				"const target = arguments[0];" +
+				"const links = Array.from(document.querySelectorAll(\"a[href*='/imgres?'], a[href*='imgurl=']\"));" +
+				"const link = links.find(a => a.href === target || a.getAttribute('href') === target);" +
+				"if (!link) return false;" +
+				"link.scrollIntoView({block: 'center'});" +
+				"link.click();" +
+				"return true;",
+				href
+		);
+
+		return Boolean.TRUE.equals(result);
+	}
+
+	private String waitAndExtractPreviewImageUrl(WebDriverWait wait) {
+		try {
+			wait.until(ExpectedConditions.presenceOfAllElementsLocatedBy(GOOGLE_FULL_IMAGES));
+		} catch (TimeoutException e) {
+			LOG.info("No aparecio imagen grande en la vista previa");
+			return null;
+		}
+
+		List<WebElement> fullImages = driver.findElements(GOOGLE_FULL_IMAGES);
+
+		LOG.info("Imagenes grandes candidatas encontradas: {}", fullImages.size());
+
+		String bestUrl = null;
+		long bestArea = 0;
+
+		for (WebElement image : fullImages) {
+			try {
+				String src = image.getAttribute("src");
+				String dataSrc = image.getAttribute("data-src");
+				String currentSrc = image.getAttribute("currentSrc");
+				String candidate = null;
+
+				if (isValidImageUrl(src)) {
+					candidate = getFinalUrl(src);
+				} else if (isValidImageUrl(currentSrc)) {
+					candidate = getFinalUrl(currentSrc);
+				} else if (isValidImageUrl(dataSrc)) {
+					candidate = getFinalUrl(dataSrc);
+				}
+
+				if (!isValidImageUrl(candidate)) {
+					continue;
+				}
+
+				long width = parseLongOrZero(image.getAttribute("naturalWidth"));
+				long height = parseLongOrZero(image.getAttribute("naturalHeight"));
+				long area = width * height;
+
+				if (area > bestArea) {
+					bestArea = area;
+					bestUrl = candidate;
+				}
+			} catch (Exception e) {
+				LOG.info("No se pudo leer imagen grande candidata: {}", e.getClass().getSimpleName());
+			}
+		}
+
+		return bestUrl;
+	}
+
 	private void checkExistenceOfResults(WebDriverWait wait, UrlQuery urlQuery) {
 		try {
-			wait.until(ExpectedConditions.presenceOfAllElementsLocatedBy(GOOGLE_IMAGE_THUMBNAILS));
+			wait.until(ExpectedConditions.or(
+					ExpectedConditions.presenceOfAllElementsLocatedBy(GOOGLE_DIRECT_RESULT_LINKS),
+					ExpectedConditions.presenceOfAllElementsLocatedBy(GOOGLE_IMAGE_THUMBNAILS)
+			));
 		} catch (TimeoutException e) {
 			LOG.info("There are no results for query {}:", urlQuery.getQuery());
 		}
 	}
 
-	private static String extractImageUrl(WebElement element) {
-	String href = element.getAttribute("href");
+	private static String extractImgUrlFromGoogleHref(String href) {
+		if (href == null || href.isBlank()) {
+			return null;
+		}
 
-	if (isEncodedUrlWithExtraInfo(href)) {
-		String finalUrl = getFinalUrl(href);
+		try {
+			String decoded = URLDecoder.decode(href, StandardCharsets.UTF_8);
+			int startIndex = decoded.indexOf("imgurl=");
 
-		if (isValidImageUrl(finalUrl)) {
-			return finalUrl;
+			if (startIndex == -1) {
+				return null;
+			}
+
+			startIndex += "imgurl=".length();
+			int endIndex = decoded.indexOf("&", startIndex);
+
+			if (endIndex == -1) {
+				endIndex = decoded.length();
+			}
+
+			return decoded.substring(startIndex, endIndex);
+		} catch (Exception e) {
+			return null;
 		}
 	}
 
-	String src = element.getAttribute("src");
+	private static boolean isValidGoogleImageResultHref(String href) {
+		if (href == null || href.isBlank()) {
+			return false;
+		}
 
-	if (isValidImageUrl(src)) {
-		return getFinalUrl(src);
+		String lowerHref = href.toLowerCase();
+
+		if (!(lowerHref.contains("/imgres?") || lowerHref.contains("imgurl="))) {
+			return false;
+		}
+
+		String imageUrl = extractImgUrlFromGoogleHref(href);
+		return isValidImageUrl(imageUrl);
 	}
-
-	String dataSrc = element.getAttribute("data-src");
-
-	if (isValidImageUrl(dataSrc)) {
-		return getFinalUrl(dataSrc);
-	}
-
-	return null;
-}
 
 	private static boolean isValidImageUrl(String url) {
-	if (url == null || url.isBlank()) {
-		return false;
+		if (url == null || url.isBlank()) {
+			return false;
+		}
+
+		String lowerUrl = url.toLowerCase();
+
+		if (!lowerUrl.startsWith("http")) {
+			return false;
+		}
+
+		if (lowerUrl.startsWith("data:")) {
+			return false;
+		}
+
+		if (lowerUrl.contains(BASE_64)) {
+			return false;
+		}
+
+		if (lowerUrl.contains("encrypted-tbn0.gstatic.com")) {
+			return false;
+		}
+
+		if (lowerUrl.contains("fonts.gstatic.com")) {
+			return false;
+		}
+
+		if (lowerUrl.contains("gstatic.com")) {
+			return false;
+		}
+
+		if (lowerUrl.contains("google.com/logos")) {
+			return false;
+		}
+
+		if (lowerUrl.contains("google.com/search")) {
+			return false;
+		}
+
+		if (lowerUrl.contains("google.com/imgres")) {
+			return false;
+		}
+
+		if (lowerUrl.contains("search/about-this-image")) {
+			return false;
+		}
+
+		if (lowerUrl.contains("favicon")) {
+			return false;
+		}
+
+		if (lowerUrl.contains("commons.wikimedia.org/wiki/file:")) {
+			return false;
+		}
+
+		if (lowerUrl.endsWith(".svg") || lowerUrl.contains(".svg?")) {
+			return false;
+		}
+
+		if (lowerUrl.endsWith(".ico") || lowerUrl.contains(".ico?")) {
+			return false;
+		}
+
+		return hasImageExtension(lowerUrl);
 	}
 
-	if (!url.startsWith("http")) {
-		return false;
+	private static boolean hasImageExtension(String lowerUrl) {
+		return lowerUrl.contains(".jpg")
+				|| lowerUrl.contains(".jpeg")
+				|| lowerUrl.contains(".png")
+				|| lowerUrl.contains(".webp")
+				|| lowerUrl.contains(".bmp");
 	}
 
-	String lowerUrl = url.toLowerCase();
+	private static String normalizeUrlFromPageSource(String url) {
+		if (url == null) {
+			return null;
+		}
 
-	if (lowerUrl.contains(BASE_64) || lowerUrl.startsWith("data:")) {
-		return false;
+		String normalized = url
+				.replace("\\/", "/")
+				.replace("\\u002F", "/")
+				.replace("\\u002f", "/")
+				.replace("\\u003A", ":")
+				.replace("\\u003a", ":")
+				.replace("\\u003D", "=")
+				.replace("\\u003d", "=")
+				.replace("\\u0026", "&")
+				.replace("\\u0026amp;", "&")
+				.replace("&amp;", "&")
+				.replace("\\u003F", "?")
+				.replace("\\u003f", "?");
+
+		normalized = cutAt(normalized, "\\");
+		normalized = cutAt(normalized, "&ved=");
+		normalized = cutAt(normalized, "&usg=");
+		normalized = cutAt(normalized, "&sa=");
+		normalized = cutAt(normalized, "#");
+
+		return normalized;
 	}
 
-	if (lowerUrl.contains("encrypted-tbn0.gstatic.com")) {
-		return false;
+	private static String cutAt(String value, String marker) {
+		int index = value.indexOf(marker);
+
+		if (index == -1) {
+			return value;
+		}
+
+		return value.substring(0, index);
 	}
 
-	if (lowerUrl.contains("gstatic.com")) {
-		return false;
-	}
-
-	if (lowerUrl.contains("google.com/logos")) {
-		return false;
-	}
-
-	if (lowerUrl.contains("fonts.gstatic.com")) {
-		return false;
-	}
-
-	if (lowerUrl.endsWith(".svg")) {
-		return false;
-	}
-
-	if (lowerUrl.endsWith(".ico")) {
-		return false;
-	}
-
-	return true;
-}
 
 	public void closeDriver() {
 		driver.quit();
@@ -635,6 +967,61 @@ public class ImageDownloader {
 		} catch (IOException e) {
 			e.printStackTrace();
 			return "[]";
+		}
+	}
+
+	private static long parseLongOrZero(String value) {
+		try {
+			if (value == null || value.isBlank()) {
+				return 0;
+			}
+
+			return Long.parseLong(value);
+		} catch (NumberFormatException e) {
+			return 0;
+		}
+	}
+
+private void saveDebugFiles(String query) {
+	try {
+		Files.createDirectories(Paths.get(DEBUG_FOLDER));
+
+		String safeQuery = query
+				.replaceAll("[^a-zA-Z0-9-_]", "_")
+				.replaceAll("_+", "_");
+
+		Path htmlPath = Paths.get(DEBUG_FOLDER, safeQuery + "-debug-google.html");
+		Path pngPath = Paths.get(DEBUG_FOLDER, safeQuery + "-debug-google.png");
+
+		Files.writeString(htmlPath, driver.getPageSource(), StandardCharsets.UTF_8);
+
+		java.io.File screenshot = ((org.openqa.selenium.TakesScreenshot) driver)
+				.getScreenshotAs(org.openqa.selenium.OutputType.FILE);
+
+		Files.copy(
+				screenshot.toPath(),
+				pngPath,
+				java.nio.file.StandardCopyOption.REPLACE_EXISTING
+		);
+
+		LOG.info("Debug guardado en: {} y {}", htmlPath, pngPath);
+	} catch (Exception e) {
+		LOG.error("No se pudo guardar debug", e);
+	}
+}
+	private static String sanitizeFileName(String value) {
+		if (value == null || value.isBlank()) {
+			return "query";
+		}
+
+		return value.replaceAll("[^a-zA-Z0-9-_]", "_");
+	}
+
+	private static void sleepQuietly(long millis) {
+		try {
+			Thread.sleep(millis);
+		} catch (InterruptedException e) {
+			Thread.currentThread().interrupt();
 		}
 	}
 }
